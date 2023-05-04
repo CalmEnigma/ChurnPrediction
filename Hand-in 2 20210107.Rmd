@@ -1,0 +1,1590 @@
+---
+title: "Final Hand-in #2"
+author: "Albert Planting-Gyllenbaga (41669)"
+date: "08/01/2021"
+output:
+  html_document:
+    number_sections: true
+    fig_width: 10
+    dpi: 600
+---
+
+```{r setup, echo=FALSE, include=FALSE}
+rm(list=ls())
+knitr::opts_chunk$set(echo = TRUE)
+options(scipen=999)
+```
+
+```{r lib, echo = FALSE, include=FALSE}
+library(dplyr)
+library(caret)
+library(e1071)
+library(MASS)
+library(RMySQL) 
+library(tree)
+library(randomForest)
+library(iRF)
+library(xgboost)
+library(mltools)
+library(keras)
+library(Matrix)
+library(FNN)
+library(MLmetrics)
+library(tidyverse)
+library(fBasics)
+library(fastAdaboost)
+library(formattable)
+library(h2o)
+library(pROC)
+library(VIM)
+```
+
+```{r, echo = FALSE, include=FALSE}
+con = dbConnect(MySQL(), dbname = "ToyStorey",
+                host = "mysql-2.cda.hhs.se", port = 3306,
+                user = "toystorey", password = "toys@sse")
+```
+
+# Why would a customer be exclusive or not?
+
+I understand exclusive as meaning that a customer has only bought toys form Toy Storey, and not the other toy companies.
+
+Intuitively, a customer is more likely to be exclusive if they have a good experience with Toy Storey. This may be reflected in the number of products they have had to return or whether they
+have been able to benefit from discount codes.
+
+Customers who buy many products from Toy Storey may also particularly like the company. However, they may also be frequent buyers of toys not only from Toy Storey but also from other toy companies. On the other hand, one-time buyers may only have bought one toy, and decided to buy it from Toy Storey, making them exclusive customers.
+
+The number of transactions may be less ambiguous if interpreted along with other variables, such as age, gender, transaction size (in terms of number of products bought and $ spent). Age and gender are likely very informative as the spending habits of people change according to these factors. For example, customers over 30 are most likely parents or grandparents and may use ToyStorey as a one-stop-shop for their children's presents.
+
+The longer the time since a customer last made a purchase at Toy Storey, the less likely they are to be exclusive too as there is a longer period of time during which they could have made a purchase elsewhere.
+
+The transaction month may also be important, since many customers who are buying presents for Christmas, for example, may not be loyal Toy Storey customers.
+
+The categories a customer buys could reflect what type of customer they are too. For example, customers who buy specialty toys may be more sophisticated buyers, who evaluate the products at Toy Storey's competitors too and may thus be less likely to be exclusive.
+
+These considerations guide my choice of model features.
+
+
+
+# Initial Data Exploration
+
+### Initial look at the Exclusive table
+
+Many customers in the Exclusive table are not in the Receipt table. Toy Storey's
+proprietary data may therefore be difficult to use.
+```{r, warning = FALSE}
+n <- dbGetQuery(con, "select count(distinct customer_id) as n
+from Exclusive
+union
+select count(distinct customer_id) as n
+FROM Receipt r
+WHERE !ISNULL(customer_id)
+      AND EXISTS (SELECT customer_id FROM Exclusive WHERE Exclusive.customer_id = r.customer_id)")
+
+rownames(n) = c("Number of distinct customer_id's in Exclusive table",
+                "Number of Exclusive table customer_id's in Receipt table")
+n
+paste("We see that", n[1,1]-n[2,1], "customers are in the Exclusive table but not the Receipt table.")
+```
+
+I notice no customer_ids are missing, but many values are missing the exclusive target.
+These will have to be dropped later.
+```{r, warning = FALSE}
+n <- dbGetQuery(con, "select *, tot_customer_ids - missing_exclusive as useable_customer_ids
+from
+(select count(distinct customer_id) as tot_customer_ids, sum(isnull(customer_id)) as missing_ids,
+sum(isnull(exclusive)) as missing_exclusive
+from Exclusive) as a")
+n
+```
+
+I check that all customers in the Exclusive table have made a purchase at ToyStorey
+to confirm that this variable cannot be used as a predictor.
+```{r, warning = FALSE}
+n <- dbGetQuery(con, "select count(distinct customer_id) as n_TS_customers
+from CreditCardData
+left join Exclusive using(customer_id)
+where merchant_id = 4585085")
+n
+```
+
+### Initial look at the customer_ids I need for which I need to predict Exclusive
+
+Similarly to the Exclusive table, many of my ids are not in the Receipt table
+```{r, warning = FALSE}
+my_ids <- as_vector(read.delim("41669.txt", header = F, col.names = "customer_id"))
+my_ids1 = my_ids
+
+n <- dbGetQuery(con, "select distinct customer_id as n from Receipt")
+n = sum(my_ids %in% n$n)
+paste(length(my_ids)-n,
+      "of my customer_ids are not in the Receipt table. These observations can only be predicted using CreditCardData.")
+```
+
+I confirm that we cannot see the merchants (other than Toy Storey) at which the customers
+in my personal IDs have made transactions. Thus, I cannot use the percent of transactions
+made at Toy Storey as a predictor.
+```{r, warning = FALSE}
+n <- dbGetQuery(con, "select customer_id, merchant_id from CreditCardData")
+
+x = subset(n, customer_id %in% my_ids1)
+x = subset(x, merchant_id != 4585085)
+x
+```
+
+### Initial look at the CreditCard data
+```{r, warning = FALSE}
+# Gender breakdown for Toy Storey customers
+n <- dbGetQuery(con, "select gender, count(gender) as n
+from
+	(select customer_id, gender, birth_year, merchant_id
+	from CreditCardData
+	where merchant_id = 4585085
+	group by customer_id, gender, birth_year) as a
+group by gender")
+n
+
+# Average age of Toy Storey customers
+n <- dbGetQuery(con, "select 2016 -round(AVG(birth_year)) as avg_age
+from
+	(select customer_id, gender, birth_year, merchant_id
+	from CreditCardData
+	where merchant_id = 4585085
+	group by customer_id, gender, birth_year) as a")
+n
+```
+
+
+### Initial look at selected instances of combined data
+
+I show this to reflect a small part of the more detailed data exploration and understanding that occurred.
+
+Here is a case where gift wrapping is bought for an unknown product and no price is registered
+Therefore, total spend should be calculated based on the CreditCard data 'amount' variable
+```{r, warning = FALSE}
+n <- dbGetQuery(con, 'select *
+from CreditCardData
+left join Receipt using (transaction_date, customer_id)
+left join ReceiptProduct using (receipt_id)
+left join Product using (product_id)
+where receipt_id = "26deb988b0c7c9439096f0d928283411"
+group by receipt_product_id')
+n
+```
+
+
+Mechanics of two discount codes: GETGIFT4FREE AND MA20GIC
+
+The discount code name is applied to all products in the basket and has its own
+DISCOUNT_CODE product name, which should be dropped when calculated the
+number of products bought
+```{r}
+n <- dbGetQuery(con, 'select *
+from CreditCardData
+left join Receipt using (transaction_date, customer_id)
+left join ReceiptProduct using (receipt_id)
+left join Product using (product_id)
+where discount_code ="GETGIFT4FREE"
+group by receipt_product_id
+limit 10')
+n
+
+n <- dbGetQuery(con, 'select *
+from CreditCardData
+left join Receipt using (transaction_date, customer_id)
+left join ReceiptProduct using (receipt_id)
+left join Product using (product_id)
+where discount_code ="MA20GIC"
+group by receipt_product_id
+limit 10')
+n
+```
+
+
+
+
+# Import data
+
+*Note*: As customer_ids may be linked to different individuals, I group the data by customer_id,
+gender and age in order to aggregate data at the level of the individual. When it comes to making predictions, I will choose the individual with most transactions in the customer_id to determine
+the prediction.
+
+In order to do this, I have had to replace missing values for gender and age in SQL, otherwise
+the observations are dropped when joining by customer_id, gender and age. For gender, I have replaced NAs with "female" as it is by far the most common gender. For age, I have replaced NAs with 40, the average age of other customers. (See above)
+
+
+## Data imported from CreditCardData
+
+- customer_id, gender, age, exclusive
+
+- top_device: the most commonly used device by each individual
+
+- tot_trans_ts: total number of transactions made at ToyStorey
+
+- tot_spend_ts: total amount spent at ToyStorey
+
+- months_since_ts: the number of months since a individual last bought from ToyStorey
+
+- top_month: the month in which a individual has spent the most at ToyStorey
+
+```{r import_a, warning = FALSE}
+df1 = dbGetQuery(con, 'select * from
+(SELECT customer_id, gender, 2016-birth_year as age, exclusive, 
+if(n=max_n, a.device, "Not top") as top_device
+FROM    
+     (SELECT customer_id, IfNULL(gender, "female") as gender,
+     device, IfNULL(birth_year , 1976) as birth_year,
+     exclusive, count(device) AS n
+      from CreditCardData
+      left join Exclusive Using (customer_id)
+      GROUP BY customer_id, gender, birth_year, device) As a
+LEFT JOIN 
+     (SELECT customer_id, gender, birth_year, b.device, Max(n) As max_n
+      FROM
+           (SELECT customer_id, IfNULL(gender, "female") as gender,
+           IfNULL(birth_year , 1976) as birth_year,
+           device, Count(device) AS n
+            from CreditCardData ccd 
+            LEFT JOIN Exclusive Using (customer_id)
+            GROUP BY customer_id, gender, birth_year, device) As b
+      GROUP BY customer_id, gender, birth_year) as max_tbl
+Using (customer_id, gender, birth_year)) as c')
+
+# Total transactions and total spend at ToyStorey, and months_since
+ts_trans = dbGetQuery(con, 'select customer_id, IfNULL(gender, "female") as gender,
+2016-IfNULL(birth_year , 1976) as age,
+sum(amount) as tot_spend_ts,
+count(id) as tot_trans_ts,
+round(min(days_since)/30) as months_since_ts
+from 
+	(select *, datediff("2015-12-31", transaction_date) as days_since
+	from CreditCardData) as a
+where merchant_id = 4585085
+group by customer_id, gender, birth_year')
+
+# Top transaction month
+top_mon = dbGetQuery(con, 'select *
+from
+(SELECT customer_id, gender, 2016-birth_year as age, 
+if(n=max_n, a.mon, "Not top") as top_month
+FROM    
+     (SELECT customer_id, IfNULL(gender, "female") as gender,
+     IfNULL(birth_year , 1976) as birth_year, 
+     month(transaction_date) as mon,
+     sum(amount) AS n
+      from CreditCardData
+      where customer_id is not NULL and merchant_id = 4585085
+      GROUP BY customer_id, gender, birth_year, mon) As a
+LEFT JOIN 
+     (SELECT customer_id, gender, birth_year, b.mon, Max(n) As max_n
+      FROM
+           (SELECT customer_id, IfNULL(gender, "female") as gender,
+           IfNULL(birth_year , 1976) as birth_year, 
+           month(transaction_date) as mon,
+		   sum(amount) AS n
+		   from CreditCardData
+		   where customer_id is not NULL and merchant_id = 4585085
+		   GROUP BY customer_id, gender, birth_year, mon) As b
+      GROUP BY customer_id, gender, birth_year) as max_tbl
+Using (customer_id, gender, birth_year) )as c
+where top_month != "Not top"')
+```
+
+## Preliminary Cleaning
+
+### Turn top_device into binary variables
+```{r warning = FALSE}
+# Check for inconsistently named variables
+unique(df1$top_device)
+# no inconsistencies, but "Not top" results need to be dropped as they indicate that the device is not the most frequently used by the individual
+
+# Check for NAs
+sum(is.na(df1$top_device))
+
+# Top device -> Replace NAs with "Unknown"
+df1[is.na(df1$top_device),]$top_device = "Unknown"
+
+# Drop "Not top" obervations, as these are duplicates indicating that that device was not the most common
+df1 = subset(df1, top_device != "Not top")
+
+# Summarise to turn into binary variable
+df1 = df1 %>% group_by(customer_id, gender, age, exclusive) %>% summarise(
+  top_mob = sum(top_device=="Mobile"),
+  top_desk = sum(top_device=="Desktop"),
+  top_tab = sum(top_device=="Tablet"),
+  top_other = sum(top_device=="Other"),
+  top_unknown = sum(top_device=="Unknown"))
+```
+
+
+### Turn top_mon into binary variables
+```{r warning = FALSE}
+# Check for NAs
+sum(is.na(top_mon$top_month)) # No NAs
+
+# Turn month numbers into month names, classed a factor
+top_mon$top_month = factor(month.abb[as.numeric(top_mon$top_month)])
+
+# Turn the variable into binary variables
+mons = unique(top_mon$top_month)
+x = data.frame(matrix(mons, nrow =1))
+colnames(x) = mons
+
+for (i in mons) {
+  top_mon[i] = ifelse(top_mon$top_month == i, 1, 0)
+}
+
+# Summarise again to take group individuals who may have multiple top months
+mons = as_vector(as.character(mons))
+top_mon = top_mon %>% group_by(customer_id, gender, age) %>% summarise(across(all_of(mons), list(sum)))
+
+# Rename the top_month columns
+colnames(top_mon) = str_replace(colnames(top_mon), "1", "top")
+```
+
+### Join the datasets
+```{r join_a, warning = FALSE}
+# Join the datasets
+df3 <- left_join(df1, ts_trans, by = c("customer_id", "gender", "age")) %>%
+  left_join(top_mon, by = c("customer_id", "gender", "age"))
+```
+
+
+## Data imported from Toy Storey Receipt & Product data
+
+- n_prod: number of products bought from ToyStorey
+
+- n_ret: number of products returned to ToyStorey
+
+- tot_ret_val: value of all products returned to ToyStorey
+
+- n_wrap: number of items gift wrapped
+
+- n_homedel: number of home deliveries
+
+- d1: number of times the GETGIFT4FREE discount code was used
+
+- d2: number of times the MA20GIC discount code was used
+
+- d3: number of times the HJD&G6D33W discount code was used
+
+- d4: number of times the M2AGI5C discount code was used
+
+- top_cat: the product category the individual has spent the most in at ToyStorey
+
+```{r import_b, warning = FALSE, echo = T, results = 'hide'}
+# Import a variety of variable described later
+df2 = dbGetQuery(con, 'Select customer_id, gender, age,
+count(case when product_name != "GIFT_WRAPPING" or "DISCOUNT_CODE" then 1 end) as n_prod,
+sum(is_return) as n_ret,
+sum(value_returned) as tot_ret_val,
+count(case when product_name = "GIFT_WRAPPING" then 1 end) as n_wrap,
+count(distinct (case when (dist_del) != "No" then dist_del end)) as n_homedel,
+count(distinct (case when dist_d like "%GETGIFT4FREE%" then dist_d end)) as d1,
+count(distinct (case when dist_d like "%MA20GIC%" then dist_d end)) as d2,
+count(distinct (case when dist_d like "%HJD&G6D33W%" then dist_d end)) as d3,
+count(distinct (case when dist_d like "%M2AGI5C%" then dist_d end)) as d4
+from
+(select customer_id, product_name, is_return,
+	IfNULL(gender, "female") as gender,
+	2016-IfNULL(birth_year , 1976) as age,
+	datediff("2015-12-31", transaction_date) as days_since,
+	is_return*price as value_returned,
+	if(home_delivery=0, "No", concat(receipt_id, home_delivery)) as dist_del,
+	if(discount_code is NULL, "No", concat(receipt_id, discount_code)) as dist_d
+from CreditCardData
+left join Receipt using (transaction_date, customer_id)
+left join ReceiptProduct using (receipt_id)
+left join Product using (product_id)
+WHERE EXISTS (SELECT customer_id FROM CreditCardData ccd WHERE ccd.customer_id = Receipt.customer_id)
+group by customer_id, gender, age, receipt_product_id) as a
+group by customer_id, gender, age')
+
+# Import top categories per customer
+cat = dbGetQuery(con, 'SELECT *
+FROM
+(SELECT customer_id, gender, age,
+if(b.n=max_n, b.cat, "Not top") as top_cat
+FROM    
+	 (select  customer_id, gender, age, cat, sum(price) as n
+	 from
+		(SELECT customer_id, IfNULL(gender, "female") as gender,
+			receipt_product_id, price,
+			2016-IfNULL(birth_year , 1976) as age,
+			SUBSTRING_INDEX(category, " >", 1) AS cat
+	    from CreditCardData
+		left join Receipt using (transaction_date, customer_id)
+		left join ReceiptProduct using (receipt_id)
+		left join Product using (product_id)
+		WHERE EXISTS (SELECT customer_id FROM CreditCardData ccd WHERE ccd.customer_id = Receipt.customer_id)
+		group by customer_id, gender, age, receipt_product_id) As a
+		group by customer_id, gender, age, cat) as b
+		
+	LEFT JOIN 
+	(select customer_id, gender, age, cat, Max(n) As max_n	
+	from
+		 (select  customer_id, gender, age, cat, sum(price) as n
+		 from
+			(SELECT customer_id, IfNULL(gender, "female") as gender,
+				receipt_product_id, price,
+				2016-IfNULL(birth_year , 1976) as age,
+				SUBSTRING_INDEX(category, " >", 1) AS cat
+		    from CreditCardData
+			left join Receipt using (transaction_date, customer_id)
+			left join ReceiptProduct using (receipt_id)
+			left join Product using (product_id)
+			WHERE EXISTS (SELECT customer_id FROM CreditCardData ccd WHERE ccd.customer_id = Receipt.customer_id)
+			group by customer_id, gender, age, receipt_product_id) As c
+			group by customer_id, gender, age, cat) as d
+	group by customer_id, gender, age) as e
+	Using (customer_id, gender, age) ) as f
+where top_cat != "Not top"')
+
+dbDisconnect(con)
+rm(con)
+```
+
+# Data Cleaning 1
+
+## Turn top categories into binary variables
+```{r warning = FALSE}
+# Save a version of cat
+catold = cat
+
+# Check for inconsistently named variables
+cats = unique(cat$top_cat)
+cats # No inconsistently named variables
+
+# Check for NAs
+sum(is.na(cat$top_cat)) # no NAs
+
+# Turn the variable into binary variables
+x = data.frame(matrix(cats, nrow =1))
+colnames(x) = cats
+
+for (i in cats) {
+  cat[i] = ifelse(cat$top_cat == i, 1, 0)
+}
+
+# Summarise again to take group individuals who may have multiple top months
+cat = cat %>% group_by(customer_id, gender, age) %>%
+  summarise(across(all_of(cats), list(sum)))
+
+# Rename the top_month columns
+colnames(cat) = str_replace(colnames(cat), "1", "top")
+```
+
+
+
+## Join the datasets and select customer_ids
+
+Select customer_ids that I need to predict and those in Exclusive 
+```{r join_b, warning = FALSE}
+# Join the datasets
+df3 <- left_join(df3, df2, by = c("customer_id", "gender", "age")) %>%
+  left_join(cat, by = c("customer_id", "gender", "age"))
+
+# Select customer_ids
+exc = df3 %>% subset(!is.na(exclusive))
+#observations where exclusive is NA are dropped, since this is our target variable and must exist
+
+exc = unique(exc$customer_id)
+ids = c(my_ids1, exc) # add the customer ids that I need to predict
+ids = df3$customer_id %in% ids
+df = df3[ids, ]
+
+glimpse(df)
+```
+
+
+## Check for naming inconsistencies in categorical variables
+```{r clean_a, warning = FALSE}
+# top_device, top_cat and top_month were all checked earlier when they turned to binary
+
+# Check gender for naming inconsistencies
+unique(df$gender) # no naming inconsistencies
+```
+
+## Fix the number of products bought
+
+From my data exploration, I noticed that some customers' receipts only contain gift_wraps and discount_codes. This creates an issue with one of my later predictors - the % of products gift wrapped - since I exclude gift_wraps and discount codes from my calculation of total products bought. Therefore, I must fix the cases where total products are 0 in my dataset. I choose to do this by giving such individuals 1 product bought.
+```{r clean_aa, warning = FALSE}
+df$n_prod = ifelse(df$n_prod==0, 1, df$n_prod)
+```
+
+
+
+
+# Create Predictors
+
+When selecting my predictors, I tried to avoid ones without obvious collinearity, such as total spending, which is a product of total transactions and average spend per transaction, or average price per product, which is average spend divided by average products per transaction.
+
+### A list of my predictors:
+
+- gender, age
+
+- top_(device name) = is this the individual's top device?
+
+- (month)_top = has the individual spent the most at Toy Storey on this month?
+
+- (category)_top = has the individual spent the most at Toy Storey on this category?
+
+- months_since_ts = number of months since the last purchase at Toy Storey
+
+- tot_trans_ts = total transactions made at Toy Storey
+
+- av_spend = average amount spent per transaction at Toy Storey
+
+- av_prod = average number of products bought from Toy Storey per transaction
+
+- nret_prc = % of products returned
+
+- vret_prc = % of total amount spent that was returned
+
+- home_prc = % of transactions delivered home
+
+- wrap_prc = % of products gift wrapped
+
+- d_1 = has the GETGIFT4FREE discount code been used?
+
+- d_2 = has the MA20GIC discount code been used?
+
+- d_3 = has the HJD&G6D33W discount code been used?
+
+- d_4 = has the M2AGI5C discount code been used?
+
+- n_disc = total discount codes used
+
+- shared = does the individual share his credit card?
+
+
+### Create Predictors
+
+```{r creat, warning = FALSE}
+# Save a version of the original inputs
+df4 = df
+
+# Create new predictors and merge with existing ones
+x = df %>% transmute(customer_id, gender, age,
+                     av_spend = tot_spend_ts/tot_trans_ts,
+                     av_prod = n_prod/tot_trans_ts,
+                     nret_prc = n_ret/n_prod,
+                     vret_prc = tot_ret_val/tot_spend_ts,
+                     home_prc = n_homedel/tot_trans_ts,
+                     wrap_prc = n_wrap/n_prod,
+                     n_disc = d1+d2+d3+d4,
+                     d_1 = ifelse(d1>0, 1, 0),
+                     d_2 = ifelse(d2>0, 1, 0),
+                     d_3 = ifelse(d3>0, 1, 0),
+                     d_4 = ifelse(d4>0, 1, 0))
+i = c("tot_spend_ts", "n_prod", "n_ret", "tot_ret_val", "n_wrap", "n_homedel",
+      "d1", "d2", "d3", "d4")
+df = df[!(colnames(df) %in% i)]
+df = left_join(df, x, by = c("customer_id", "gender", "age"))
+
+# Create new variable for customers that share a credit card
+x = subset(df$customer_id, duplicated(df$customer_id))
+df$shared = ifelse(df$customer_id %in% x, 1, 0)
+```
+
+
+# Data Cleaning 2
+
+## Fix Variable Names
+```{r clean_name, warning = FALSE}
+# Fix variables names
+colnames(df) = str_replace_all(colnames(df), " ", "")
+colnames(df) = str_replace_all(colnames(df), "&", "_")
+colnames(df) = str_replace_all(colnames(df), "-", "")
+```
+
+## Replace NAs and remove duplicates
+
+There are a larger amount of NAs in the non-CreditCardData variables as many customers that are in the CreditCard data are not in ToyStorey's data. I suspect these NAs are likely missing at random (MAR) and can be modelled to some extent using variables where data is not missing. Therefore, I replace most NAs with a KNN imputation which should help retain slightly more information as opposed to simply using the mean or mode of each variable.
+
+However, given the sheer number of NAs of this type, I acknowledge that regardless of how I deal with the missing data, a lot of information on each individual will be missing from each of these variables, which may adversely affect model performance. Therefore, while I execute the replacement of NAs here, I will be selective regarding which of the non-Credit Card data variables I choose to include when running each of my models.
+
+
+```{r clean_ab, warning = FALSE, cache = TRUE}
+# See which variables have missing values
+vars_na = colnames(df)[colSums(is.na(df)) > 0]
+vars_na = vars_na[vars_na != "exclusive"]
+vars_na
+
+# Select variables that have no missing values
+vars_ccd = colnames(df)[colSums(is.na(df)) == 0]
+vars_ccd = vars_ccd[vars_ccd != "customer_id"]
+
+# Replace NAs
+for (i in vars_na) {
+  set.seed(7313)
+  df = kNN(df, variable = i, dist_var = vars_ccd, imp_var = F)
+}
+
+# Check there are no NAs left
+vars_na = colnames(df)[colSums(is.na(df)) > 0]
+vars_na = vars_na[vars_na != "exclusive"]
+vars_na
+
+# Remove duplicates
+df = df[!duplicated(df), ]
+```
+
+## Dealing with age
+Based on my visualisation of exclusive across age, I select 4 main bins for age: under 20s, 20 to 60s, 60s to 75s and over 75s. Thus, I turn age into a categorical variable and then into dummies.
+```{r clean_age, warning = FALSE}
+# Save a version of df with the continuous age variable
+df_age = df
+
+# Plot the ratio of exclusive across ages
+df_age$exclusive = as_factor(as.character(df_age$exclusive)) # turn exclusive into a factor
+levels(df_age$exclusive) = c("Yes", "No")
+ggplot(drop_na(df_age), aes(x = age, fill = exclusive)) +
+    geom_histogram(color = "black", alpha = 0.5, position = "fill",
+                   binwidth = 5, center = 17.5) +
+    xlab("Age") +
+    ylab("") +
+    scale_y_continuous(labels = percent(c(0, 0.25, 0.5, 0.75, 1), 0)) +
+    labs(title = "% of exclusive customers by age bucket of 5 years")
+
+# Based on this visualisation, I choose to turn age into a categorical variable with 4 levels
+df$age2 = ifelse(df$age<20, "Un20",
+         ifelse(df$age>=20 & df$age<=60, "TwentyToSixty",
+         ifelse(df$age>60 & df$age<75, "SixtyToSeventy5", "Over75")))
+
+# Turn the new categorical age variable into binary variables
+ages = df %>% group_by(customer_id, gender, age) %>% summarise(
+  Un20 = as_factor(sum(age2=="Un20")),
+  TwentyToSixty = as_factor(sum(age2=="TwentyToSixty")),
+  SixtyToSeventy5 = as_factor(sum(age2=="SixtyToSeventy5")),
+  Over75 = as_factor(sum(age2=="Over75")))
+
+# Join the new ages back to the main df
+df = left_join(df, ages, by = c("customer_id", "gender", "age"))
+
+# Drop age2
+x = "age2"
+df = df[!(colnames(df) %in% x)]
+```
+
+## Adjusting classes
+```{r clean_class, warning = FALSE}
+# Save a numeric version of the df
+df_n = df
+
+# Turn binary variables representing whether the category is the individual's top one to factors
+x = grepl("top", colnames(df))
+df[x] = lapply(df[x], as_factor)
+
+# Turn other natural factors to factors
+df$exclusive = as_factor(df$exclusive)
+df$gender = as_factor(df$gender)
+df$d_1 = as_factor(as.character(df$d_1))
+df$d_2 = as_factor(as.character(df$d_2))
+df$d_3 = as_factor(as.character(df$d_3))
+df$d_4 = as_factor(as.character(df$d_4))
+df$shared = as_factor(as.character(df$shared))
+
+# Fix level names
+x = sapply(df, is.factor)
+x = colnames(dplyr::select(ungroup(df[x]), -gender))
+x = match(x, colnames(df))
+for (i in x) {
+  levels(df[[i]]) = list(Yes = 1, No = 0)
+}
+
+# Other variables are numeric and remain numeric
+
+# Adjust numerical version of the dataframe
+df_n$gender = ifelse(df_n$gender == "female", 1, 0)
+
+# Check the classes
+glimpse(df)
+
+# Drop factors with only one level
+df = df[, sapply(df, nlevels) == 0 | sapply(df, nlevels) >1]
+```
+
+
+### Visualisation of top categories versus exclusive
+
+Clear differences can be seen in Men, Educational toys, Dogs and Cooking & Dining
+However, there are too few observations for there to be much predictive power.
+Educational Toys offers slightly more than the others, but is still underpopulated.
+``` {r visual, warning = FALSE}
+# Plot % of exclusive customers by top category
+x = left_join(df[c("customer_id", "gender", "age", "exclusive")], catold,
+                 by = c("customer_id", "gender", "age"))
+ggplot(drop_na(x), aes(x = factor(top_cat), fill = exclusive)) +
+    geom_histogram(color = "black", alpha = 0.5, position = "fill",
+                   binwidth = 5, center = 17.5, stat = "count") +
+    xlab("Top Category") +
+    ylab("") +
+    scale_y_continuous(labels = percent(c(0, 0.25, 0.5, 0.75, 1), 0)) +
+    labs(title = "% of exclusive customers by top category") +
+    coord_flip()
+
+# Check number of obs
+x = c("Men_top", "EducationalToys_top", "Dogs_top", "Cooking_Dining_top")
+colSums(df[x] == "Yes")
+```
+
+
+# Data Splitting
+
+## Separate out the customers I need to predict
+
+For individuals in my_ids that share credit cards, I choose the individual with the most money spent at TS as the one for whom I will predict exclusive.
+``` {r sep, warning = FALSE}
+# Separate the datasets, both for normal and numeric dfs
+my_ids = df %>% subset(customer_id %in% my_ids1)
+my_ids_n = df_n %>% subset(customer_id %in% my_ids1)
+df = df %>% subset(!(customer_id %in% my_ids1))
+
+# Identify each individual in my_ids
+my_ids$id = paste(my_ids$customer_id, my_ids$age, my_ids$gender)
+
+# Select the individuals with a shared card
+sh1 = subset(my_ids, shared == "Yes") %>%
+  dplyr::select(customer_id, tot_trans_ts, av_spend, id)
+
+# Select the individual under the same customer_id who spent the most
+sh1$tot_spend = sh1$tot_trans_ts*sh1$av_spend
+max = sh1 %>% group_by(customer_id) %>%
+  summarise(m1 = max(tot_spend))
+sh1 = left_join(sh1, max, by = "customer_id")
+sh1$choose = ifelse(sh1$tot_spend == sh1$m1, 1, 0)
+sh = subset(sh1, choose == 1)
+
+# Keep the individuals that do not share their card or spend the most in their customer_id
+sh1 = subset(sh1, !(id %in% sh$id))
+my_ids_new = my_ids[!(my_ids$id %in% sh1$id),]
+my_ids_new = dplyr::select(my_ids_new, -id)
+my_ids_new_n = my_ids_n[!(my_ids$id %in% sh1$id),]
+
+
+# Check there are 1000 customer ids in my_ids_new and that they are unique
+nrow(my_ids_new)
+length(unique(my_ids_new$customer_id))
+
+# Check that remaining NAs in 'exclusive' in df are 0
+sum(is.na(df$exclusive))
+```
+
+## Create Training and Test sets
+```{r split_data, warning = FALSE}
+# Drop customer_id as it is not a predictor
+df = df[, (colnames(df) != "customer_id")]
+
+# Create partition
+set.seed(7313)
+x = as.numeric(createDataPartition(df$exclusive, p = 0.7, list = FALSE))
+
+# Create standard datasets
+train = df[x,]
+test = df[-x,]
+```
+
+```{r drop, include = FALSE}
+rm(list = c("cats", "exc", "i", "ids", "mons", "max", "sh", "sh1", "levels"))
+```
+
+
+# Data Cleaning 3
+
+## Drop categorical variables with too few positive observations
+
+Too little variability in the predictor makes it very unlikely to be good and can trip up some models.
+```{r clean_drop, warning = FALSE}
+# Find the categorical variables with less than 10 positive observations 
+x = train %>% dplyr::select(where(is.factor))
+x = as.data.frame(cbind(colnames(x), colSums(x =="Yes")))
+colnames(x) = c("Var", "n")
+x$n = as.numeric(as.character(x$n))
+x$Var = as.character(x$Var)
+x = subset(x, n < 10)
+x = rownames(x[!(rownames(x) %in% c("exclusive", "gender")),])
+
+# Drop categorical variables with fewer than 10 positive observations
+train = train[!(colnames(train) %in% x)]
+test = test[!(colnames(test) %in% x)]
+```
+
+
+## Check distributions of numerical predictors in the training set
+
+- I note that differences in numerical variables are limited between exclusive and non-exclusive customers. Combined with the few differences in top categories, it seems my model's predictive power may be limited due lack of distinguishing features between exclusives and not exclusives
+
+- I note that there may be outliers in: tot_trans_ts, av_spend, av_prod and av_price
+```{r clean_c, warning = FALSE}
+# Check distributions of numeric predictors for exclusive customers
+x = subset(train, exclusive == "Yes")
+x = x %>% ungroup() %>% dplyr::select(where(is.numeric))
+n = colnames(x)
+stats <- basicStats(x[n])
+stats <- stats[c("Mean", "Median", "Stdev", "Minimum", "1. Quartile", "3. Quartile", "Maximum"),]
+round(stats, 1)
+
+# Check distributions of numeric predictors for non-exclusive customers
+x = subset(train, exclusive == "No")
+x = x %>% ungroup() %>% dplyr::select(where(is.numeric))
+n = colnames(x)
+stats <- basicStats(x[n])
+stats <- stats[c("Mean", "Median", "Stdev", "Minimum", "1. Quartile", "3. Quartile", "Maximum"),]
+round(stats, 1)
+
+# Check distributions of numeric predictors *all* customers
+x = train %>% ungroup() %>% dplyr::select(where(is.numeric))
+n = colnames(x)
+stats <- basicStats(x[n])
+stats <- stats[c("Mean", "Median", "Stdev", "Minimum", "1. Quartile", "3. Quartile", "Maximum"),]
+round(stats, 1)
+```
+
+## Visualise and deal with outliers
+
+I only deal with outliers in the training set so that the models still have to deal with
+potential outliers in the test set.
+``` {r clean_cc, warning = FALSE}
+# Total transactions versus average spend
+ggplot(train, aes(x = tot_trans_ts, y = av_spend, colour = exclusive)) +
+  geom_point(stat = "identity", shape = 16)
+
+# Average number of products per transaction versus average price per product
+ggplot(train, aes(x = av_prod, y = av_spend, colour = exclusive)) +
+  geom_point(stat = "identity", shape = 16)
+```
+
+### I decide to just drop some outliers in total_transactions and av_spend
+```{r}
+x = max(train$tot_trans_ts)
+train = subset(train, tot_trans_ts != x)
+train = subset(train, av_spend < 500)
+```
+
+
+
+# Modelling
+
+Predicting exclusive is a binary classification problem. Therefore, I will use the following models: 
+
+Logistic regression, LDA, QDA, K-nearest-neighbours,
+Decision trees, Random Forests, AdaBoost,
+XGBoost, SVM, Neural Networks and AutoML
+
+### Create numeric and scaled training and test datasets
+```{r scale, warning = FALSE}
+# Create numeric training set
+ntrain = train
+ntrain$gender = ifelse(ntrain$gender == "female", 1, 0)
+
+x = sapply(ntrain, is.factor)
+x = colnames(ntrain[x])
+x = match(x, colnames(ntrain))
+for (i in x) {
+  ntrain[i] = ifelse(ntrain[i] == "Yes", 1, 0)
+}
+
+# Create numeric test set
+ntest = test
+ntest$gender = ifelse(ntest$gender == "female", 1, 0)
+
+x = sapply(ntest, is.factor)
+x = colnames(ntest[x])
+x = match(x, colnames(ntest))
+for (i in x) {
+  ntest[i] = ifelse(ntest[i] == "Yes", 1, 0)
+}
+
+# Create scaled sets
+x = colnames(dplyr::select(ntrain, -exclusive))
+ztrain = as.data.frame(cbind(train$exclusive, scale(ntrain[x])))
+names(ztrain)[1] = "exclusive"
+ztrain$exclusive = as.factor(ifelse(ztrain$exclusive == 1, "Yes", "No"))
+
+ztest = as.data.frame(cbind(test$exclusive, scale(ntest[x])))
+names(ztest)[1] = "exclusive"
+ztest$exclusive = as.factor(ifelse(ztest$exclusive == 1, "Yes", "No"))
+```
+
+### Create Principal Components
+
+Binary variables are not suitable for PCA, which is a problem as my dataset has a lot of binary variables. I try to apply PCA to my continuous variables only, but suspect the models running
+this reduced dataset may not be as accurate.
+
+```{r pca, warning = FALSE}
+# Select non-binary variables
+x = train %>% dplyr::select(where(is.numeric), exclusive)
+x = x[colnames(x) != "gender"]
+
+# Create Principal Components
+train.pca = prcomp(dplyr::select(x, -exclusive), scale = T)
+
+# Number of components required to explain 90% of the variation
+train.pca$var = train.pca$sdev^2
+pve=train.pca$var/sum(train.pca$var)
+plot(cumsum(pve), xlab = " Principal Component",
+     ylab = "Cumulative Proportion of Variance Explained", 
+     ylim=c(0,1), type="b")
+
+# Select cutoff where marginal impact of a new pc approaches 0
+n_pc = sum(cumsum(pve)<0.95)+1
+n_pc
+
+# Create PCA train set df with exclusive
+train.pca2 = data = cbind(train.pca$x[,1:n_pc], ntrain$exclusive)
+train.pca2 = as.data.frame(train.pca2)
+train.pca2$exclusive = factor(train.pca2$exclusive)
+levels(train.pca2$exclusive) = list(Yes = 1, No = 0)
+
+# Create PCA test set by applying pca.train to avoid leakage of test data into training data
+test.pca2 = predict(train.pca, test)[,1:n_pc]
+```
+
+### Set cross-validation method
+
+To reduce the risk of overfitting, I use cross-validation with 10 folds, as well holding out a test set. To assess overall model strength, I choose to use the ROC metric.
+```{r CV}
+control = trainControl(method = "cv", number = 10, 
+                       classProbs = T, summaryFunction = twoClassSummary)
+
+metric = "ROC"
+```
+
+### No-information rate
+
+I want to make sure the accuracy of my models is above this level of accuracy.
+```{r inf}
+# Check proportion of training set that is exclusive
+x = mean(train$exclusive == "Yes")
+paste("If I were to guess that all individuals are exclusive, my accuracy would be:", round(x,3))
+```
+
+## Model 1: Logistic Regression
+
+*Predictor selection*: PCA does not offer any predictive power, so I decide not to employ it. I have selected variables using forward stepwise selection instead. I tested the model using standardised variables as well. The forward stepwise predictors were the same, the accuracies similar, but there was slightly more overfitting. Therefore, I use the unstandardised train dataset.
+
+*Overfitting*: However, it seems to overfit a little more than other models, likely because more variables are included.
+```{r logit, warning=FALSE}
+# PCA offers accuracy equivalent to the no-information rate
+fit.logit = train(exclusive ~., data = train.pca2, method = "glm", family=binomial,
+                  trControl = control, metric = metric)
+acc.logit = confusionMatrix(predict(fit.logit, train.pca$x[,1:n_pc]),
+                            train$exclusive)
+round(acc.logit$overall[1], 3)
+
+# Fit stepwise model
+set.seed(7313)
+fit.logit <- train(exclusive ~., data = train, trControl = control,
+                   metric = metric, method = "glmStepAIC", family=binomial,
+                   direction = "forward", trace = F)
+
+# Check model summary and coefficient signficance
+summary(fit.logit)
+
+# Predictors chosen by stepwise forward selection
+x = names(fit.logit$finalModel$coefficients)
+x = str_replace(x, "Yes", "")
+x = str_replace(x, "No", "")
+x = str_replace(x, "male", "")
+vars_fwd = c("exclusive", x[2:length(x)])
+vars_fwd
+
+# Train accuracy
+pred.train = predict(fit.logit, dplyr::select(train, -exclusive)) 
+acc.logit = confusionMatrix(pred.train, train$exclusive)
+round(acc.logit$overall[1], 3)
+
+# Test accuracy
+pred.test = predict(fit.logit, dplyr::select(test, -exclusive))
+acc.logit = confusionMatrix(pred.test, test$exclusive)
+round(acc.logit$overall[1], 3)
+```
+
+
+## Model 2: LDA
+
+*Predictor selection*: Due to the similarity of the models, I selected the same variables as chosen by the logit forward stepwise regression.
+
+*Overfitting*: As train and test accuracy are similar, overfitting is likely not an
+issue with this model. However, it seems to overfit a little more than other models, likely because more variables are included.
+```{r lda, warning=FALSE}
+# Predictors that have the most positive impact on test accuracy
+vars_lda = c(vars_fwd)
+
+# Fit model
+set.seed(7313)
+fit.lda <- train(exclusive ~., data = train[vars_lda], trControl = control, metric = metric,
+                 method = "lda")
+
+# Train accuracy
+pred.train = predict(fit.lda, dplyr::select(train, -exclusive)) 
+acc.lda = confusionMatrix(pred.train, train$exclusive)
+round(acc.lda$overall[1], 3)
+
+# Test accuracy
+pred.test = predict(fit.lda, dplyr::select(test, -exclusive))
+acc.lda = confusionMatrix(pred.test, test$exclusive)
+round(acc.lda$overall[1], 3)
+```
+
+
+## Model 3: QDA
+
+*Predictor selection*: PCA proves very inferior again. In fact, it does so for every other model - either by having inferior train accuracy of by significantly overfitting - so I have not displayed it in the models after this.
+
+Using the predictors selected by forward stepwise earlier, the QDA displayed accuracy below the no-information rate. Re-evaluating each of the predictors, I choose new variables that much improve the QDA's performance. I also tried adding other variables that were not selected by forward stepwise, but they did not add to performance. However, using age as a continuous variable improves performance, so I choose to use it over the categorical version of age.
+
+*Overfitting*: As train and test accuracy are similar, overfitting is likely not an
+issue with this model.
+
+```{r qda, warning=FALSE}
+# PCA offers accuracy below the no-information rate
+fit.qda = train(exclusive ~., data = train.pca2, method = "qda",
+                  trControl = control, metric = metric)
+
+# PCA train accuracy
+acc.qda = confusionMatrix(predict(fit.qda, train.pca$x[,1:n_pc]),
+                            train$exclusive)
+round(acc.qda$overall[1], 3)
+
+# PCA test accuracy
+pred.test = predict(fit.qda, test.pca2)
+acc.qda = confusionMatrix(pred.test, test$exclusive)
+round(acc.qda$overall[1], 3)
+
+
+
+# Predictors that have the most positive impact on test accuracy
+vars_qda = vars_fwd[!(vars_fwd %in% c("Characters_Brands_top", "Figures_Playsets_top",
+                                      "Baby_ToddlerToys_top", "d_2", "PartySupplies_top",
+                                      "May_top", "Dec_top", "shared", "top_unknown",
+                                      "Over75", "TwentyToSixty"))]
+vars_qda = c(vars_qda, "age")
+
+# Fit model
+set.seed(7313)
+fit.qda <- train(exclusive ~., data = train[vars_qda], trControl = control, metric = metric,
+                 method = "qda")
+
+# Train accuracy
+pred.train = predict(fit.qda, dplyr::select(train, -exclusive)) 
+acc.qda = confusionMatrix(pred.train, train$exclusive)
+round(acc.qda$overall[1], 3)
+
+# Test accuracy
+pred.test = predict(fit.qda, dplyr::select(test, -exclusive))
+acc.qda = confusionMatrix(pred.test, test$exclusive)
+round(acc.qda$overall[1], 3)
+```
+
+
+
+## Model 4: K-Nearest-Neigbours
+
+*Predictor selection*: The model was overfitting a lot using the complete train dataset. The predictors selected earlier by stepwise led to much less overfitting. Using these as a base, I evaluated the incremental impact on test accuracy of each additional variable and selected 3 with the largest positive impact. However, these actually increased overfitting without benefitting accuracy, so I decided to just stick with the variables selected by forward stepwise. Furthermore, I noticed that a subsection of the forward_stepwise variables reduced model performance as well, so I excluded these variables.
+
+*Overfitting*: As train and test accuracy are similar, but this model seems to be overfitting a little bit more than the Logit and LDA.
+```{r knn, warning=FALSE}
+# Select variables
+vars_knn = vars_fwd[!(vars_fwd %in% c("Characters_Brands_top", "Figures_Playsets_top",
+                                      "Baby_ToddlerToys_top", "d_2", "PartySupplies_top",
+                                      "May_top", "Dec_top", "shared"))]
+
+# Fit model
+set.seed(7313)
+fit.knn <- train(exclusive ~., data = train[vars_knn], trControl = control, metric = metric,
+                 method = "knn")
+
+# Train accuracy
+pred.train = predict(fit.knn, dplyr::select(train, -exclusive)) 
+acc.knn = confusionMatrix(pred.train, train$exclusive)
+round(acc.knn$overall[1], 3)
+
+# Test accuracy
+pred.test = predict(fit.knn, dplyr::select(test, -exclusive))
+acc.knn = confusionMatrix(pred.test, test$exclusive)
+round(acc.knn$overall[1], 3)
+```
+
+
+
+## Model 5: Decision tree
+
+*Predictor selection*: Likely because it tunes tree depth, the model does not seem to overfit, even using all the variables in the training set. Thus, I select all of them.
+
+*Overfitting*: As train and test accuracy are similar, overfitting is likely not an
+issue with this model.
+```{r tree, warning=FALSE}
+# Fit model
+set.seed(7313)
+fit.tree <- train(exclusive ~., data = train, trControl = control, metric = metric,
+                 method = "rpart2")
+
+# Plot tree
+plot(fit.tree$finalModel)
+text(fit.tree$finalModel)
+
+# Train accuracy
+pred.train = predict(fit.tree, dplyr::select(train, -exclusive)) 
+acc.tree = confusionMatrix(pred.train, train$exclusive)
+round(acc.tree$overall[1], 3)
+
+# Test accuracy
+pred.test = predict(fit.tree, dplyr::select(test, -exclusive))
+acc.tree = confusionMatrix(pred.test, test$exclusive)
+round(acc.tree$overall[1], 3)
+```
+
+
+
+## Model 6: Random Forest
+
+*Predictor selection*: The model overfit a lot using all training variables. Therefore I tested various subsets of the forward stepwise variables, as well as some additional variables that improved accuracy while not causing overfitting. Unscaled variables appear to perform slightly better than scaled ones.
+
+*Overfitting*: As train and test accuracy are similar, overfitting is likely not an
+issue with this model.
+```{r random_forest, warning = FALSE}
+# Select predictors
+vars_rf = vars_fwd[!(vars_fwd %in% c("exclusive", "Characters_Brands_top",
+                                     "Figures_Playsets_top","Baby_ToddlerToys_top",
+                                     "d_2", "PartySupplies_top",
+                                      "May_top", "Dec_top", "shared", "top_unknown",
+                                      "Over75", "TwentyToSixty"))]
+  
+vars_rf = c(vars_rf, "vret_prc", "nret_prc", "age")
+
+# Fit model
+set.seed(7313)
+fit.rf = randomForest(
+  x = train[vars_rf],
+  y = as.factor(train$exclusive))
+
+# Variable importance scores
+varImpPlot(fit.rf)
+
+# Train accuracy
+pred.train = predict(fit.rf, train)
+acc.rf = confusionMatrix(pred.train, train$exclusive)
+acc.rf$overall[1]
+
+# Test accuracy
+pred.test = predict(fit.rf, test)
+acc.rf = confusionMatrix(pred.test, test$exclusive)
+acc.rf$overall[1]
+```
+
+
+
+
+## Model 7: AdaBoost
+
+*Predictor selection*: The unscaled models offered low accuracy and overfit. Therefore, I used scaled variables, which greatly improves the accuracy and leads to less overfitting. Using a subset of the forward stepwise variables, I reduced the discrepancy
+between training and test accuracies without sacrificing much test accuracy.
+
+*Overfitting*: This model seems to overfit a little more than the others, but not by much.
+
+```{r ada, warning = FALSE, cache = TRUE}
+# Select predictors
+vars_ada = vars_fwd[!(vars_fwd %in% c("Characters_Brands_top", "Figures_Playsets_top",
+                                      "Baby_ToddlerToys_top", "d_2", "PartySupplies_top",
+                                      "May_top"))]
+
+# Fit model
+set.seed(7313)
+fit.ada <- train(exclusive ~., data = ztrain[vars_ada], trControl = control, metric = metric,
+                 method = "adaboost")
+
+# Train accuracy
+pred.train = predict(fit.ada, dplyr::select(ztrain, -exclusive))
+pred.train = factor(pred.train, levels = c("Yes", "No"))
+acc.ada = confusionMatrix(pred.train, train$exclusive)
+round(acc.ada$overall[1], 3)
+
+# Test accuracy
+pred.test = predict(fit.ada, dplyr::select(ztest, -exclusive))
+pred.test = factor(pred.test, levels = c("Yes", "No"))
+acc.ada = confusionMatrix(pred.test, test$exclusive)
+round(acc.ada$overall[1], 3)
+```
+
+
+
+## Model 8: XGBoost
+
+*Predictor selection*: The unscaled models offered accuracy below the no-information rate. Therefore, I used scaled variables, which greatly improves the accuracy and leads to less overfitting. The performance using all features was good, but I reduced the discrepancy
+between training and test accuracies without sacrificing much test accuracy by selecting the forward stepwise variables.
+
+*Categorisation threshold*: After testing several of them, using a threshold of 0.528 yields the best accuracy vs overfitting trade-off.
+
+*Overfitting*: As train and test accuracy are similar, overfitting is likely not an
+issue with this model.
+```{r xgb, warning=FALSE}
+# Select predictors
+vars_xgb = vars_fwd[!(vars_fwd %in% c("Characters_Brands_top", "Figures_Playsets_top",
+                                      "Baby_ToddlerToys_top", "d_2", "PartySupplies_top",
+                                      "May_top", "Dec_top", "shared", "top_unknown",
+                                      "Over75"))]
+
+# Transform predictor to sparce matrix to save space
+sparse_matrix = sparse.model.matrix(exclusive~.-1, data = ztrain[vars_xgb])
+
+# Fit model
+fit.xgb = xgboost(
+  data = sparse_matrix, 
+  nrounds = 10, 
+  label = ntrain$exclusive, 
+  objective = "binary:logistic",
+  verbose = 0)
+
+# Train accuracy
+pred.train = predict(fit.xgb, as.matrix(dplyr::select(ztrain[vars_xgb], -exclusive)))
+pred.train = ifelse(pred.train > 0.528, 1, 0)
+acc.xgb = confusionMatrix(factor(pred.train), factor(ntrain$exclusive))
+round(acc.xgb$overall[1], 3)
+
+# Test accuracy
+pred.test = predict(fit.xgb, as.matrix(dplyr::select(ztest[vars_xgb], -exclusive)))
+pred.test = ifelse(pred.test > 0.528, 1, 0)
+acc.xgb = confusionMatrix(factor(pred.test), factor(ntest$exclusive))
+round(acc.xgb$overall[1], 3)
+```
+
+
+
+## Model 9: Support Vector Machine
+
+*Predictor selection*: I use standardised variables here. While using all the variables did not really overfit, using a subset of the variables selected by forward stepwise improved test accuracy and reduced overfitting.
+
+*Overfitting*: As train and test accuracy are similar, overfitting is likely not an
+issue with this model.
+```{r svm, warning=FALSE}
+# Select predictors
+vars_svm = vars_fwd[!(vars_fwd %in% c("Characters_Brands_top",
+                                     "Figures_Playsets_top","Baby_ToddlerToys_top",
+                                     "d_2", "PartySupplies_top",
+                                      "May_top", "Dec_top", "shared", "top_unknown",
+                                      "Over75"))]
+
+# Fit model
+set.seed(7313)
+fit.svm <- train(exclusive ~., data = ztrain[vars_svm], trControl = control, metric = metric,
+                 method = "svmRadial")
+
+# Train accuracy
+pred.train = predict(fit.svm, dplyr::select(ztrain, -exclusive)) 
+acc.svm = confusionMatrix(pred.train, train$exclusive)
+round(acc.svm$overall[1], 3)
+
+# Test accuracy
+pred.test = predict(fit.svm, dplyr::select(ztest, -exclusive))
+acc.svm = confusionMatrix(pred.test, test$exclusive)
+round(acc.svm$overall[1], 3)
+```
+
+
+
+
+## Model 10: Neural Network
+
+*Predictor selection*: Scaled predictors were superior in terms of both accuracy and overfitting. To reduce overfitting, I started by choosing from the forward stepwise variables and then adding a few more that improved accuracy without increasing overfitting.
+
+*NN calibration*: I tested various layers, activation functions (relu, leaky relu, sigmoid and swish), and batch sizes. Passing batch sizes of 64 through an input layer of Leaky relu, two hidden layers of Leaky relu and a sigmoid output layer yielded the best results. I use 50 epochs such that loss metrics converge.
+
+*Categorisation threshold*: After testing several of them, using a threshold of 0.516 yields the best accuracy vs overfitting trade-off.
+
+*Overfitting*: As train and test accuracy are similar, overfitting is likely not an
+issue with this model.
+```{r nn, warning=FALSE}
+# Select predictors
+vars_nn = vars_fwd[!(vars_fwd %in% c("Figures_Playsets_top",
+                                      "Baby_ToddlerToys_top", "d_2", "PartySupplies_top",
+                                      "May_top", "Dec_top", "top_unknown",
+                                      "Over75"))]
+vars_nn = c(vars_nn, "Un20", "av_spend", "av_prod","Games_top")
+
+# Adjust data classes for NN
+x_nntrain = dplyr::select(ztrain[vars_nn], -exclusive) %>% as.matrix()
+y_nntrain = ntrain$exclusive %>% as.integer()
+x_nntest = dplyr::select(ztest[vars_nn], -exclusive) %>% as.matrix()
+y_nntest = ntest$exclusive %>% as.integer()
+
+# Initiate Keras
+rm(model)
+model = keras_model_sequential() 
+
+# Define model structure
+model %>%
+  # Input layer
+  layer_dense(units = 256, input_shape =  ncol(x_nntrain)) %>%
+  layer_activation_leaky_relu() %>% 
+  layer_dropout(rate = 0.5) %>% 
+  # Hidden layer
+  layer_activation_leaky_relu() %>% 
+  layer_activation_leaky_relu() %>% 
+  # Output layer: final output is one var
+  layer_dropout(rate = 0.5) %>%
+  layer_dense(units = 1, activation = "sigmoid")
+
+model %>% compile(
+  optimizer = 'adam',
+  loss = 'binary_crossentropy',
+  metrics = 'accuracy')
+
+# Run NN
+history = model %>% 
+  fit(x_nntrain,   
+      y_nntrain,         
+      epochs = 50,     #num of passes over data
+      batch_size = 64,    #num samples propogated thru the network
+      validation_split = 0.2,
+      verbose = 0)  
+plot(history) 
+
+# Train accuracy
+model %>% evaluate(x_nntrain, y_nntrain)
+train.pred = as.factor(ifelse(model %>% predict_proba(x_nntrain) >0.516, 1, 0))
+acc.nn = confusionMatrix(train.pred, as.factor(y_nntrain))
+round(acc.nn$overall[1], 3)
+
+# Test accuracy
+model %>% evaluate(x_nntest, y_nntest)
+test.pred = as.factor(ifelse(model %>% predict_proba(x_nntest) >0.516, 1, 0))
+acc.nn = confusionMatrix(test.pred, as.factor(y_nntest))
+round(acc.nn$overall[1], 3)
+```
+
+```{r drop2, include = FALSE}
+rm(list = c("ages", "cat", "df_age", "df_n", "df1", "df2", "df3", "df4", "top_mon", "ts_trans"))
+```
+
+
+
+
+## Model 11: Auto Machine Learning
+
+*Overfitting*: This model does not seem to be overfitting either.
+```{r auto, warning=FALSE, echo = T, results = 'hide'}
+# Initialise H2O
+h2o.init()
+
+# Transform data into H20AutoML formats
+x.names = colnames(dplyr::select(train,-exclusive))
+y.names = "exclusive"
+train.h2o = as.h2o(train)
+test.h2o = as.h2o(test)
+
+# Fit model
+fit.auto = h2o.automl(
+  x = x.names,
+  y = y.names,
+  training_frame = train.h2o,
+  max_runtime_secs = 300,
+  seed = 7313)
+```
+
+```{r warning = FALSE}
+# Train accuracy
+pred.train = predict(fit.auto, train.h2o) 
+acc.auto = confusionMatrix(factor(array(pred.train$predict)), train$exclusive)
+round(acc.auto$overall[1], 3)
+
+# Test accuracy
+pred.test = predict(fit.auto, test.h2o) 
+acc.auto = confusionMatrix(factor(array(pred.test$predict)), test$exclusive)
+round(acc.auto$overall[1], 3)
+```
+
+
+
+
+``` {r eg, eval = FALSE, include = FALSE}
+### Example of the code used to check the accuracy for each additional variable in some models
+x = colnames(train)[!(colnames(train) %in% vars_fwd)]
+for (i in x) {
+  y = c(vars_fwd, i)
+  print(i)
+  fit <- train(exclusive ~., data = train[y], trControl = control, metric = metric,
+                 method = "qda")
+  pred = predict(fit, dplyr::select(test, -exclusive))
+  acc = confusionMatrix(pred, test$exclusive)
+  print(round(acc$overall[1], 2))
+}
+
+x = "exclusive"
+for (i in vars_fwd[2:length(vars_fwd)]) {
+  tryCatch({
+  x = c(x, i)
+  print(i)
+  fit <- train(exclusive ~., data = train[x], trControl = control, metric = metric,
+                 method = "knn")
+  pred = predict(fit, dplyr::select(test, -exclusive))
+  acc = confusionMatrix(pred, test$exclusive)
+  print(round(acc$overall[1], 2))
+  }, error=function(e){})
+}
+```
+
+
+
+
+# Model Evaluation and Choice
+
+## Model Comparison
+
+*Note* The XGB and NN models reversed the positive and negative values for exclusive so their specificity and sensitivity are reversed compared to the other models.
+``` {r comps, warning = FALSE}
+# Select metrics to display
+metrics1 = c("Accuracy", "Kappa")
+metrics2 = c("Sensitivity", "Specificity", "Balanced Accuracy")
+
+# Models to compare
+mods = c("acc.logit", "acc.lda", "acc.qda", "acc.knn", "acc.tree", "acc.rf",
+         "acc.ada", "acc.xgb", "acc.svm", "acc.nn", "acc.auto")
+
+# Select confusion table statistics for each model
+comp = data.frame(matrix(ncol = length(c(metrics1, metrics2)),
+                         nrow = length(mods)))
+for (i in mods) {
+  n = match(i, mods)
+  x = get(i)
+  x = c(x$overall[metrics1], x$byClass[metrics2])
+  comp[n, ] = x
+}
+
+# Format table
+colnames(comp) = c(metrics1, metrics2)
+rownames(comp) = str_replace(mods, "acc.", "")
+comp = round(comp, 3)
+
+# Model comparison
+comp
+```
+
+## Model Selection
+
+None of the models seem really great. I have tried adding in new predictors to see if performance can be improved, but the impact was small. Most likely, it is just very difficult to predict exclusive using the information given in Toy Storey's databases.
+
+Of the less complicated models (logit to tree), QDA has the best trade-off between accuracy, sensitivity and specificity. The more complicated models perform slightly better though. Since our task is just to make the best predictions, lack of intepretability is not an issue so I prefer going for the more complicated but more accurate models. When fitting each of them I have also made reasonably sure they are not overfitting.
+
+Of these, Random Forest, Adaboost, XGBoost and the Neural Network appear to have the best trade-off between accuracy, sensitivity and specificity - reflected in their higher kappas and balanced accuracies.
+
+Comparing these advanced models and the QDA based on ROC curve and AUC confirms they are similar. The XGBoost model models comes out slightly on top versus the Neural Network. *XGBoost* is my final choice because it is very similar in terms of performance (and slightly better) than NN, but uses fewer variables, making it less likely to be overspecified.
+```{r choose, warning = FALSE}
+# XGBoost ROC curve and AUC
+pred.test = predict(fit.xgb, as.matrix(dplyr::select(ztest[vars_xgb], -exclusive)),
+                    type = "prob")
+par(pty="s")
+plot.roc(ntest$exclusive, pred.test, percent = T, main = "ROC Curves", col = 1)
+auc(ntest$exclusive, pred.test)
+
+# AdaBoost ROC curve and AUC
+pred.test = predict(fit.ada, dplyr::select(ztest, -exclusive), type = "prob")
+plot.roc(ntest$exclusive, pred.test$Yes, percent = T, add = T, col = 2)
+auc(ntest$exclusive, pred.test$Yes)
+
+# NN ROC curve and AUC
+pred.test = model %>% predict_proba(x_nntest)
+plot.roc(ntest$exclusive, pred.test, percent = T, add = T, col = 3)
+auc(ntest$exclusive, pred.test)
+
+# Random Forest ROC curve and AUC
+pred.test = as.data.frame(predict(fit.rf, test, type = "prob"))
+plot.roc(ntest$exclusive, pred.test$Yes, percent = T, add = T, col = 4)
+auc(ntest$exclusive, pred.test$Yes)
+
+# QDA ROC curve and AUC
+pred.test = as.data.frame(predict(fit.qda, test, type = "prob"))
+plot.roc(ntest$exclusive, pred.test$Yes, percent = T, add = T, col = 5)
+auc(ntest$exclusive, pred.test$Yes)
+
+# Format ROC plot and AUC
+legend(x = 40, y = 40, c("XGB", "Ada", "NN", "RF", "QDA"), lty=1, 
+    col = c(1, 2, 3, 4, 5), bty="n", inset=c(0,-0.15))
+```
+
+
+
+
+# Applying the Model to my IDs
+```{r final, warning = FALSE}
+# Select variables for my ids
+x = c(colnames(my_ids_new_n[(colnames(my_ids_new_n) %in% colnames(ntrain))]),
+      "customer_id")
+x = x[x != "exclusive"]
+my_ids_final = my_ids_new_n[x]
+
+# Fix classes
+x = sapply(my_ids_final, is.factor)
+x = colnames(my_ids_final[x])
+x = match(x, colnames(my_ids_final))
+for (i in x) {
+  my_ids_final[[i]] = as.numeric(as.character(my_ids_final[[i]]))
+}
+
+# Merge my_ids back into the training set to get more observations for scaling
+x = ntrain[colnames(ntrain) != "exclusive"]
+x = mutate(x, customer_id = 1)
+x = rbind(my_ids_final, x)
+
+# Scale the dataset and separate out my_ids again
+x = cbind(customer_id = x$customer_id, scale(x[colnames(x) != "customer_id"]))
+x = as.data.frame(x)
+my_ids_final = x %>% subset(customer_id != 1)
+
+# Make predictions
+vars_final = vars_xgb[vars_xgb != "exclusive"]
+final_preds = predict(fit.xgb, as.matrix(my_ids_final[vars_final]))
+final_preds = ifelse(final_preds > 0.528, 1, 0)
+
+# Link predictions to customer_ids
+final_preds = cbind(customer_id = my_ids_final$customer_id, final_preds)
+final_preds = final_preds %>% as.data.frame()
+colnames(final_preds) = c("customer_id", "exclusive")
+
+# Export predictions to txt
+write.table(final_preds, file = "41669 - Final exclusive predictions.txt",
+            sep = ",", row.names = F)
+```
+
+Thank you for the course!
+
+
+
+``` {r scrap, eval = FALSE, include = FALSE}
+# Select variables for my ids
+x = c(colnames(my_ids_new_n[(colnames(my_ids_new_n) %in% colnames(ntrain))]),
+      "customer_id")
+x = x[x != "exclusive"]
+my_ids_final = my_ids_new[x]
+
+# Make predictions
+vars_final = vars_qda[vars_qda != "exclusive"]
+final_preds = predict(fit.qda, my_ids_final[vars_final])
+
+# Link predictions to customer_ids
+final_preds = cbind(customer_id = my_ids_final$customer_id, final_preds)
+final_preds = final_preds %>% as.data.frame()
+colnames(final_preds) = c("customer_id", "exclusive")
+```
+
+``` {r scrap2, eval = FALSE, include = FALSE}
+vars_final = vars_svm[vars_svm != "exclusive"]
+final_preds = predict(fit.qda, y)
+
+sum(final_preds$exclusive)
+sum(final_preds$exclusive ==2)
+sum(final_preds$exclusive ==1)
+sum(final_preds)
+##
+vars_final = vars_nn[vars_nn != "exclusive"]
+nn_myids = my_ids_final[vars_final] %>% as.matrix()
+final_preds = ifelse((model %>% predict_proba(nn_myids)) >0.516 , 1,0)
+
+sum(final_preds == "Yes")
+
+acc.logit
+acc.xgb
+
+x = basicStats(my_ids_final[vars_final])
+```
